@@ -11,5 +11,11 @@
 	"assets": {
 		"directory": "./dist/client",
 		"not_found_handling": "single-page-application"
-	}
+	},
+	"kv_namespaces": [
+		{
+			"binding": "SURVEY_KV",
+			"id": "52ede0c836ec4ffd8b354914e1dc0cbb"
+		}
+	]
 }

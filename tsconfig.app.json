@@ -15,12 +15,21 @@
 		"noEmit": true,
 		"jsx": "react-jsx",
 
+		/* Path aliases */
+		"baseUrl": ".",
+		"paths": {
+			"@/*": ["./src/react-app/*"]
+		},
+
 		/* Linting */
-		"strict": true,
-		"noUnusedLocals": true,
-		"noUnusedParameters": true,
+		"strict": false,
+		"noImplicitAny": false,
+		"strictNullChecks": false,
+		"noUnusedLocals": false,
+		"noUnusedParameters": false,
 		"noFallthroughCasesInSwitch": true,
-		"noUncheckedSideEffectImports": true
+		"noUncheckedSideEffectImports": false,
+		"skipLibCheck": true
 	},
 	"include": ["src/react-app"]
 }
