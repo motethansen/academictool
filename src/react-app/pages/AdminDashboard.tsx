@@ -1,10 +1,13 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { GROUPS, DIMENSIONS, getStoredSubmissions, type SurveySubmission } from "@/lib/survey-data";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis } from "recharts";
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
+} from "recharts";
 import { motion } from "framer-motion";
 import { toast } from "sonner";
 
@@ -40,6 +43,7 @@ function computeAverages(submissions: SurveySubmission[]) {
 const AdminDashboard = () => {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const [pdfLoading, setPdfLoading] = useState(false);
 
   const { data: submissions = [], isLoading } = useQuery({
     queryKey: ["submissions"],
@@ -71,6 +75,8 @@ const AdminDashboard = () => {
     return { group: g, average: Math.round(avg * 100) / 100 };
   }).sort((a, b) => b.average - a.average);
 
+  // ── handlers ──────────────────────────────────────────────────────────────
+
   const handleReset = async () => {
     if (!window.confirm("Are you sure you want to delete ALL survey submissions? This cannot be undone.")) return;
     const token = sessionStorage.getItem("admin-token") ?? "";
@@ -93,47 +99,83 @@ const AdminDashboard = () => {
     navigate("/admin/login");
   };
 
-  const handleDownloadPDF = () => {
-    const printWindow = window.open("", "_blank");
-    if (!printWindow) { toast.error("Please allow pop-ups to download PDF."); return; }
+  const handleDownloadPDF = async () => {
+    const el = document.getElementById("pdf-content");
+    if (!el) { toast.error("Could not find content to export."); return; }
 
-    const tableRows = overallScores.map((s) =>
-      `<tr><td style="padding:8px;border:1px solid #ddd;">${s.group}</td><td style="padding:8px;border:1px solid #ddd;text-align:center;">${s.average}</td></tr>`
-    ).join("");
+    setPdfLoading(true);
+    toast.info("Generating PDF — this may take a few seconds…");
 
-    const detailTables = GROUPS.map((g) => {
-      const rows = DIMENSIONS.map((d) =>
-        `<tr><td style="padding:6px;border:1px solid #ddd;">${d.label}</td><td style="padding:6px;border:1px solid #ddd;text-align:center;">${averages[g][d.key]}</td></tr>`
-      ).join("");
-      return `<div style="margin-bottom:24px;"><h3 style="margin:0 0 8px;">${g}</h3><table style="width:100%;border-collapse:collapse;font-size:14px;"><thead><tr><th style="padding:6px;border:1px solid #ccc;background:#f5f5f5;text-align:left;">Dimension</th><th style="padding:6px;border:1px solid #ccc;background:#f5f5f5;text-align:center;">Avg Score</th></tr></thead><tbody>${rows}</tbody></table></div>`;
-    }).join("");
+    try {
+      // Dynamic imports keep them out of the main bundle
+      const html2canvas = (await import("html2canvas")).default;
+      const { jsPDF } = await import("jspdf");
 
-    const submissionLog = submissions.map((s, i) => {
-      const ratingRows = Object.entries(s.ratings).map(([target, dims]) => {
-        const scores = DIMENSIONS.map(d => `${d.label}: ${(dims as Record<string,number>)[d.key] || '-'}`).join(', ');
-        return `<li><strong>${target}</strong>: ${scores}</li>`;
-      }).join('');
-      return `<div style="margin-bottom:12px;"><strong>Submission ${i+1}</strong> — by ${s.evaluatorGroup} (${new Date(s.submittedAt).toLocaleString()})<ul style="margin:4px 0;">${ratingRows}</ul></div>`;
-    }).join('');
+      // Capture the full content area at 2× for crisp output
+      const canvas = await html2canvas(el, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: "#ffffff",
+        logging: false,
+      });
 
-    printWindow.document.write(`<!DOCTYPE html><html><head><title>Survey Report</title><style>body{font-family:system-ui,sans-serif;padding:40px;color:#1a1a2e;}h1{font-size:24px;}h2{font-size:18px;margin-top:32px;}table{width:100%;border-collapse:collapse;}@media print{body{padding:20px;}}</style></head><body>
-      <h1>Peer Evaluation Survey Report</h1>
-      <p style="color:#666;">Generated: ${new Date().toLocaleString()} &bull; ${submissions.length} submissions</p>
-      <h2>Overall Ranking</h2>
-      <table><thead><tr><th style="padding:8px;border:1px solid #ccc;background:#f5f5f5;text-align:left;">Group</th><th style="padding:8px;border:1px solid #ccc;background:#f5f5f5;text-align:center;">Average Score</th></tr></thead><tbody>${tableRows}</tbody></table>
-      <h2>Scores by Dimension</h2>
-      ${detailTables}
-      <h2>Individual Submissions</h2>
-      ${submissionLog}
-    </body></html>`);
-    printWindow.document.close();
-    setTimeout(() => { printWindow.print(); }, 500);
+      const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+      const pageW  = pdf.internal.pageSize.getWidth();   // 210 mm
+      const pageH  = pdf.internal.pageSize.getHeight();  // 297 mm
+      const margin = 12; // mm
+      const contentW = pageW - margin * 2;
+
+      // How many mm equals one canvas pixel
+      const mmPerPx = contentW / canvas.width;
+      const totalH  = canvas.height * mmPerPx;          // total content height in mm
+      const usableH = pageH - margin * 2;               // usable height per page
+
+      let yMm = 0;
+      while (yMm < totalH) {
+        if (yMm > 0) pdf.addPage();
+
+        const sliceHMm = Math.min(usableH, totalH - yMm);
+        const srcY     = yMm / mmPerPx;
+        const srcH     = sliceHMm / mmPerPx;
+
+        // Create a temporary canvas for just this page's slice
+        const tmp = document.createElement("canvas");
+        tmp.width  = canvas.width;
+        tmp.height = Math.ceil(srcH);
+        const ctx = tmp.getContext("2d")!;
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, tmp.width, tmp.height);
+        ctx.drawImage(canvas, 0, srcY, canvas.width, srcH, 0, 0, canvas.width, srcH);
+
+        pdf.addImage(
+          tmp.toDataURL("image/jpeg", 0.92),
+          "JPEG",
+          margin, margin,
+          contentW, sliceHMm,
+        );
+
+        yMm += sliceHMm;
+      }
+
+      pdf.save(`peer-evaluation-${new Date().toISOString().split("T")[0]}.pdf`);
+      toast.success("PDF downloaded!");
+    } catch (err) {
+      toast.error("PDF generation failed.");
+      console.error(err);
+    } finally {
+      setPdfLoading(false);
+    }
   };
+
+  // ── render ────────────────────────────────────────────────────────────────
 
   return (
     <div className="min-h-screen py-12 px-4">
       <div className="max-w-5xl mx-auto space-y-8">
-        <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+
+        {/* Header — NOT included in PDF capture */}
+        <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}
+          className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
           <div>
             <h1 className="text-4xl text-primary">Teacher Dashboard</h1>
             <p className="text-muted-foreground font-sans">
@@ -141,102 +183,177 @@ const AdminDashboard = () => {
             </p>
           </div>
           <div className="flex gap-2 flex-wrap">
-            <Button onClick={handleDownloadPDF} disabled={submissions.length === 0}>Download PDF</Button>
+            <Button onClick={handleDownloadPDF} disabled={submissions.length === 0 || pdfLoading}>
+              {pdfLoading ? "Generating…" : "Download PDF"}
+            </Button>
             <Button variant="destructive" onClick={handleReset} disabled={submissions.length === 0}>Reset All Data</Button>
             <Button variant="outline" onClick={handleLogout}>Logout</Button>
           </div>
         </motion.div>
 
         {isLoading ? (
-          <Card><CardContent className="py-16 text-center"><p className="text-muted-foreground font-sans text-lg">Loading submissions…</p></CardContent></Card>
+          <Card><CardContent className="py-16 text-center">
+            <p className="text-muted-foreground font-sans text-lg">Loading submissions…</p>
+          </CardContent></Card>
         ) : submissions.length === 0 ? (
-          <Card><CardContent className="py-16 text-center"><p className="text-muted-foreground font-sans text-lg">No submissions yet.</p></CardContent></Card>
+          <Card><CardContent className="py-16 text-center">
+            <p className="text-muted-foreground font-sans text-lg">No submissions yet.</p>
+          </CardContent></Card>
         ) : (
-          <>
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.1 }}>
-              <Card>
-                <CardHeader><CardTitle>Overall Ranking</CardTitle></CardHeader>
-                <CardContent>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    {overallScores.map((item, i) => (
-                      <div key={item.group} className="text-center p-4 rounded-xl bg-muted/50">
-                        <p className="text-3xl font-bold font-sans" style={{ color: COLORS[i] }}>#{i + 1}</p>
-                        <p className="font-sans font-semibold text-foreground mt-1">{item.group}</p>
-                        <p className="text-2xl font-bold font-sans text-primary mt-1">{item.average}</p>
-                        <p className="text-xs text-muted-foreground font-sans">avg score</p>
-                      </div>
+          /* ── PDF capture starts here ─────────────────────────────────── */
+          <div id="pdf-content" className="space-y-8 bg-background p-2 rounded-xl">
+
+            {/* Report header (visible in PDF) */}
+            <div className="pt-2 pb-1">
+              <h2 className="text-2xl font-bold text-primary">Peer Evaluation Report</h2>
+              <p className="text-sm text-muted-foreground font-sans">
+                Generated {new Date().toLocaleString()} · {submissions.length} submission{submissions.length !== 1 ? "s" : ""}
+              </p>
+            </div>
+
+            {/* ── 1. Overall Ranking ── */}
+            <Card>
+              <CardHeader><CardTitle>Overall Ranking</CardTitle></CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  {overallScores.map((item, i) => (
+                    <div key={item.group} className="text-center p-4 rounded-xl bg-muted/50">
+                      <p className="text-3xl font-bold font-sans" style={{ color: COLORS[i] }}>#{i + 1}</p>
+                      <p className="font-sans font-semibold text-foreground mt-1">{item.group}</p>
+                      <p className="text-2xl font-bold font-sans text-primary mt-1">{item.average}</p>
+                      <p className="text-xs text-muted-foreground font-sans">avg score</p>
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* ── 2. Bar chart ── */}
+            <Card>
+              <CardHeader><CardTitle>Scores by Dimension</CardTitle></CardHeader>
+              <CardContent>
+                <ResponsiveContainer width="100%" height={400}>
+                  <BarChart data={barData} margin={{ top: 20, right: 30, left: 0, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(220,15%,88%)" />
+                    <XAxis dataKey="dimension" tick={{ fontSize: 11, fontFamily: "system-ui" }} angle={-20} textAnchor="end" height={80} />
+                    <YAxis domain={[0, 5]} tick={{ fontFamily: "system-ui" }} />
+                    <Tooltip contentStyle={{ fontFamily: "system-ui", borderRadius: 8 }} />
+                    <Legend wrapperStyle={{ fontFamily: "system-ui" }} />
+                    {GROUPS.map((g, i) => (
+                      <Bar key={g} dataKey={g} fill={COLORS[i]} radius={[4, 4, 0, 0]} />
                     ))}
-                  </div>
-                </CardContent>
-              </Card>
-            </motion.div>
+                  </BarChart>
+                </ResponsiveContainer>
+              </CardContent>
+            </Card>
 
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }}>
-              <Card>
-                <CardHeader><CardTitle>Scores by Dimension</CardTitle></CardHeader>
-                <CardContent>
-                  <ResponsiveContainer width="100%" height={400}>
-                    <BarChart data={barData} margin={{ top: 20, right: 30, left: 0, bottom: 5 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(220,15%,88%)" />
-                      <XAxis dataKey="dimension" tick={{ fontSize: 11, fontFamily: "system-ui" }} angle={-20} textAnchor="end" height={80} />
-                      <YAxis domain={[0, 5]} tick={{ fontFamily: "system-ui" }} />
-                      <Tooltip contentStyle={{ fontFamily: "system-ui", borderRadius: 8 }} />
-                      <Legend wrapperStyle={{ fontFamily: "system-ui" }} />
-                      {GROUPS.map((g, i) => (
-                        <Bar key={g} dataKey={g} fill={COLORS[i]} radius={[4, 4, 0, 0]} />
-                      ))}
-                    </BarChart>
-                  </ResponsiveContainer>
-                </CardContent>
-              </Card>
-            </motion.div>
-
+            {/* ── 3. Radar charts ── */}
             <div className="grid md:grid-cols-2 gap-6">
               {radarDataByGroup.map((item, idx) => (
-                <motion.div key={item.group} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 + idx * 0.1 }}>
-                  <Card>
-                    <CardHeader><CardTitle className="text-lg">{item.group}</CardTitle></CardHeader>
-                    <CardContent>
-                      <ResponsiveContainer width="100%" height={280}>
-                        <RadarChart data={item.data}>
-                          <PolarGrid stroke="hsl(220,15%,88%)" />
-                          <PolarAngleAxis dataKey="dimension" tick={{ fontSize: 10, fontFamily: "system-ui" }} />
-                          <PolarRadiusAxis domain={[0, 5]} tick={{ fontSize: 10 }} />
-                          <Radar dataKey="score" stroke={COLORS[idx]} fill={COLORS[idx]} fillOpacity={0.25} strokeWidth={2} />
-                        </RadarChart>
-                      </ResponsiveContainer>
-                    </CardContent>
-                  </Card>
-                </motion.div>
+                <Card key={item.group}>
+                  <CardHeader><CardTitle className="text-lg">{item.group}</CardTitle></CardHeader>
+                  <CardContent>
+                    <ResponsiveContainer width="100%" height={280}>
+                      <RadarChart data={item.data}>
+                        <PolarGrid stroke="hsl(220,15%,88%)" />
+                        <PolarAngleAxis dataKey="dimension" tick={{ fontSize: 10, fontFamily: "system-ui" }} />
+                        <PolarRadiusAxis domain={[0, 5]} tick={{ fontSize: 10 }} />
+                        <Radar dataKey="score" stroke={COLORS[idx]} fill={COLORS[idx]} fillOpacity={0.25} strokeWidth={2} />
+                      </RadarChart>
+                    </ResponsiveContainer>
+                  </CardContent>
+                </Card>
               ))}
             </div>
 
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.5 }}>
-              <Card>
-                <CardHeader><CardTitle>Submission Log</CardTitle></CardHeader>
-                <CardContent className="space-y-4">
-                  {submissions.map((sub, i) => (
-                    <div key={i} className="p-4 rounded-lg bg-muted/30 space-y-2">
-                      <div className="flex justify-between items-center">
-                        <p className="font-sans font-semibold text-sm text-foreground">Submission {i + 1} — {sub.evaluatorGroup}</p>
-                        <p className="text-xs text-muted-foreground font-sans">{new Date(sub.submittedAt).toLocaleString()}</p>
-                      </div>
-                      <div className="grid sm:grid-cols-3 gap-2">
-                        {Object.entries(sub.ratings).map(([target, dims]) => (
-                          <div key={target} className="text-xs font-sans">
-                            <p className="font-semibold text-foreground">{target}</p>
-                            {DIMENSIONS.map(d => (
-                              <p key={d.key} className="text-muted-foreground">{d.label}: {(dims as Record<string,number>)[d.key]}</p>
-                            ))}
-                          </div>
+            {/* ── 4. Detail scores table (groups × dimensions) ── */}
+            <Card>
+              <CardHeader><CardTitle>Detail Scores by Group</CardTitle></CardHeader>
+              <CardContent>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm font-sans border-collapse">
+                    <thead>
+                      <tr>
+                        <th className="text-left p-3 bg-muted font-semibold border rounded-tl-md">Group</th>
+                        {DIMENSIONS.map((d) => (
+                          <th key={d.key} className="text-center p-3 bg-muted font-semibold border text-xs leading-tight">
+                            {d.label}
+                          </th>
                         ))}
-                      </div>
+                        <th className="text-center p-3 bg-primary text-primary-foreground font-bold border rounded-tr-md">
+                          Average
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {GROUPS.map((g, i) => {
+                        const avg = overallScores.find((s) => s.group === g)?.average ?? 0;
+                        return (
+                          <tr key={g} className={i % 2 === 0 ? "bg-background" : "bg-muted/30"}>
+                            <td className="p-3 border font-semibold">{g}</td>
+                            {DIMENSIONS.map((d) => (
+                              <td key={d.key} className="text-center p-3 border tabular-nums">
+                                {averages[g][d.key]}
+                              </td>
+                            ))}
+                            <td className="text-center p-3 border font-bold tabular-nums"
+                              style={{ color: COLORS[i] }}>
+                              {avg}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* ── 5. Individual submission detail table ── */}
+            <Card>
+              <CardHeader><CardTitle>Individual Submissions</CardTitle></CardHeader>
+              <CardContent className="space-y-6">
+                {submissions.map((sub, i) => (
+                  <div key={i}>
+                    <div className="flex justify-between items-center mb-2">
+                      <p className="font-sans font-semibold text-sm text-foreground">
+                        Submission {i + 1} — evaluated by <span className="text-primary">{sub.evaluatorGroup}</span>
+                      </p>
+                      <p className="text-xs text-muted-foreground font-sans">
+                        {new Date(sub.submittedAt).toLocaleString()}
+                      </p>
                     </div>
-                  ))}
-                </CardContent>
-              </Card>
-            </motion.div>
-          </>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs font-sans border-collapse">
+                        <thead>
+                          <tr>
+                            <th className="text-left p-2 bg-muted border font-semibold">Dimension</th>
+                            {GROUPS.map((g) => (
+                              <th key={g} className="text-center p-2 bg-muted border font-semibold">{g}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {DIMENSIONS.map((d, di) => (
+                            <tr key={d.key} className={di % 2 === 0 ? "bg-background" : "bg-muted/20"}>
+                              <td className="p-2 border font-medium">{d.label}</td>
+                              {GROUPS.map((g) => (
+                                <td key={g} className="text-center p-2 border tabular-nums">
+                                  {(sub.ratings[g] as Record<string, number>)?.[d.key] ?? "—"}
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+
+          </div>
+          /* ── PDF capture ends here ─────────────────────────────────── */
         )}
       </div>
     </div>
